@@ -1,0 +1,166 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+
+# =========================
+# REACTOR MODEL
+# =========================
+def reactor_model(h2, co2, stoich, eff):
+
+    max_co2 = h2 / stoich
+    co2_reacted = min(co2, max_co2) * eff
+
+    product = co2_reacted
+    water = co2_reacted * (2.0 if stoich == 4.0 else 1.0)
+
+    return product, water
+
+
+# =========================
+# ANALYSIS
+# =========================
+def sensitivity_analysis(h2_feed, co2_feed):
+
+    MW_H2 = 0.002016
+    MW_CO2 = 0.04401
+
+    h2_base = h2_feed / MW_H2
+    co2_base = co2_feed / MW_CO2
+
+    h2_range = np.linspace(0.9, 1.1, 20) * h2_base
+    co2_range = np.linspace(0.9, 1.1, 20) * co2_base
+    eff_range = np.linspace(0.85, 1.0, 20)
+
+    H2, CO2 = np.meshgrid(h2_range, co2_range)
+
+    # INCREASE FIGURE SIZE (IMPORTANT CHANGE)
+    fig = plt.figure(figsize=(22, 16))
+
+    # =========================
+    # (a) CH4
+    # =========================
+    ax1 = fig.add_subplot(3, 2, 1, projection='3d')
+    Z1 = np.zeros_like(H2)
+
+    for i in range(H2.shape[0]):
+        for j in range(H2.shape[1]):
+            prod, _ = reactor_model(H2[i, j], CO2[i, j], 4.0, 0.90)
+            Z1[i, j] = prod
+
+    ax1.plot_surface(H2, CO2, Z1, cmap="viridis")
+    ax1.set_title("(a) CH$_4$ Production")
+    ax1.set_xlabel("H$_2$ (mol h$^{-1}$)")
+    ax1.set_ylabel("CO$_2$ (mol h$^{-1}$)")
+    ax1.set_zlabel("CH$_4$ (mol h$^{-1}$)")
+
+    # =========================
+    # (b) CH3OH
+    # =========================
+    ax2 = fig.add_subplot(3, 2, 2, projection='3d')
+    Z2 = np.zeros_like(H2)
+
+    for i in range(H2.shape[0]):
+        for j in range(H2.shape[1]):
+            prod, _ = reactor_model(H2[i, j], CO2[i, j], 3.0, 0.90)
+            Z2[i, j] = prod
+
+    ax2.plot_surface(H2, CO2, Z2, cmap="plasma")
+    ax2.set_title("(b) CH$_3$OH Production")
+    ax2.set_xlabel("H$_2$ (mol h$^{-1}$)")
+    ax2.set_ylabel("CO$_2$ (mol h$^{-1}$)")
+    ax2.set_zlabel("CH$_3$OH (mol h$^{-1}$)")
+
+    # =========================
+    # (c) H2O SABATIER
+    # =========================
+    ax3 = fig.add_subplot(3, 2, 3, projection='3d')
+    Z3 = np.zeros_like(H2)
+
+    for i in range(H2.shape[0]):
+        for j in range(H2.shape[1]):
+            _, water = reactor_model(H2[i, j], CO2[i, j], 4.0, 0.90)
+            Z3[i, j] = water
+
+    ax3.plot_surface(H2, CO2, Z3, cmap="cividis")
+    ax3.set_title("(c) H$_2$O Formation (Sabatier)")
+    ax3.set_xlabel("H$_2$ (mol h$^{-1}$)")
+    ax3.set_ylabel("CO$_2$ (mol h$^{-1}$)")
+    ax3.set_zlabel("H$_2$O (mol h$^{-1}$)")
+
+    # =========================
+    # (d) H2O METHANOL
+    # =========================
+    ax4 = fig.add_subplot(3, 2, 4, projection='3d')
+    Z4 = np.zeros_like(H2)
+
+    for i in range(H2.shape[0]):
+        for j in range(H2.shape[1]):
+            _, water = reactor_model(H2[i, j], CO2[i, j], 3.0, 0.90)
+            Z4[i, j] = water
+
+    ax4.plot_surface(H2, CO2, Z4, cmap="inferno")
+    ax4.set_title("(d) H$_2$O Formation (Methanol)")
+    ax4.set_xlabel("H$_2$ (mol h$^{-1}$)")
+    ax4.set_ylabel("CO$_2$ (mol h$^{-1}$)")
+    ax4.set_zlabel("H$_2$O (mol h$^{-1}$)")
+
+    # =========================
+    # (e) CH4 efficiency
+    # =========================
+    ax5 = fig.add_subplot(3, 2, 5)
+
+    y5 = [reactor_model(h2_base, co2_base, 4.0, e)[0] for e in eff_range]
+
+    ax5.plot(eff_range * 100, y5, label="CH$_4$")
+    ax5.set_title("(e) CH$_4$ vs Efficiency")
+    ax5.set_xlabel("Conversion Efficiency (%)")
+    ax5.set_ylabel("CH$_4$ (mol h$^{-1}$)")
+    ax5.grid()
+    ax5.legend()
+
+    # =========================
+    # (f) CH3OH efficiency
+    # =========================
+    ax6 = fig.add_subplot(3, 2, 6)
+
+    y6 = [reactor_model(h2_base, co2_base, 3.0, e)[0] for e in eff_range]
+
+    ax6.plot(eff_range * 100, y6, label="CH$_3$OH", color="orange")
+    ax6.set_title("(f) CH$_3$OH vs Efficiency")
+    ax6.set_xlabel("Conversion Efficiency (%)")
+    ax6.set_ylabel("CH$_3$OH (mol h$^{-1}$)")
+    ax6.grid()
+    ax6.legend()
+
+    # =========================
+    # FINAL SPACING (CLOSER PLOTS)
+    # =========================
+    plt.subplots_adjust(
+        left=0.05,
+        right=0.98,
+        bottom=0.05,
+        top=0.93,
+        wspace=0.25,   # closer horizontally
+        hspace=0.35    # closer vertically
+    )
+
+    plt.show()
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+
+    print("Advanced Sensitivity Analysis Model")
+    print("===============================\n")
+
+    h2_feed = float(input("Enter H2 feed (kg/h): "))
+    co2_feed = float(input("Enter CO2 feed (kg/h): "))
+
+    sensitivity_analysis(h2_feed, co2_feed)
+
+
+if __name__ == "__main__":
+    main()
