@@ -1,0 +1,264 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# GPU-Accelerated Model
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.inspection import permutation_importance
+import shap
+
+print("="*80)
+print(" FUEL CELL CURRENT GENERATION ESTIMATOR + ANALYSIS SUITE (GPU-ACCELERATED)")
+print("="*80)
+
+# ====================== LOAD DATA ======================
+file_name = 'Fuel cell data.csv'
+df = pd.read_csv(file_name)
+
+# Fix encoding for proper symbols
+df.columns = df.columns.str.replace('ｲ', '2')
+df.columns = df.columns.str.replace('ｰ', '°')
+
+target = 'I (A)'
+exclude_cols = ['Time (h)', 'I (A)', 'J (A/cm2)', 'Utot (V)']
+features = [col for col in df.columns if col not in exclude_cols]
+
+X = df[features]
+y = df[target]
+
+# ====================== TRAIN MODEL (GPU-ACCELERATED) ======================
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+# Updated parameters for latest XGBoost (≥ 3.0)
+model = XGBRegressor(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=8,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    tree_method='hist',           # 'hist' is recommended
+    device='cuda',                # Modern way to enable GPU
+    eval_metric='rmse'
+)
+
+print("Training model with GPU acceleration (cuda)...")
+model.fit(X_train, y_train)
+
+# Save model
+joblib.dump((model, features), 'fuel_cell_current_model.pkl')
+print("Model trained and saved successfully.")
+
+# ====================== PREDICTION ======================
+y_pred = model.predict(X_test)
+
+# ====================== ERROR METRICS ======================
+mae = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+r2 = r2_score(y_test, y_pred)
+mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
+
+print("\n📊 MODEL PERFORMANCE:")
+print(f"MAE  : {mae:.4f} A")
+print(f"RMSE : {rmse:.4f} A")
+print(f"R²   : {r2:.4f}")
+print(f"MAPE : {mape:.2f}%")
+
+# ====================== INTERACTIVE INPUT ======================
+ranges = {col: (df[col].min(), df[col].max()) for col in features}
+print("\nEnter input values for prediction:\n")
+
+input_data = {}
+for f in features:
+    mn, mx = ranges[f]
+    display_name = f if '°C' in f else f
+    val = input(f"{display_name} [{mn:.3f} - {mx:.3f}]: ")
+    input_data[f] = float(val) if val.strip() else (mn + mx) / 2
+
+loaded_model, feature_list = joblib.load('fuel_cell_current_model.pkl')
+input_df = pd.DataFrame([input_data])[feature_list]
+predicted_current = loaded_model.predict(input_df)[0]
+
+print("\n" + "="*80)
+print(f"Predicted I (A): {predicted_current:.4f}")
+print("="*80)
+
+# ====================== PLOTS (same enhanced version as before) ======================
+plt.rcParams['figure.figsize'] = (10, 6)
+
+# 1 Actual vs Predicted
+plt.figure()
+plt.scatter(y_test, y_pred, alpha=0.6)
+plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+plt.xlabel("Actual Current (A)")
+plt.ylabel("Predicted Current (A)")
+plt.title("Actual vs Predicted Current")
+plt.grid(True)
+plt.show()
+
+# 2 Residual Plot
+residuals = y_test - y_pred
+plt.figure()
+plt.scatter(y_pred, residuals, alpha=0.6)
+plt.axhline(0, color='r', linestyle='--')
+plt.xlabel("Predicted Current (A)")
+plt.ylabel("Residuals (A)")
+plt.title("Residual Plot")
+plt.grid(True)
+plt.show()
+
+# 3 Error Distribution
+plt.figure()
+plt.hist(residuals, bins=30, edgecolor='black')
+plt.xlabel("Residual (A)")
+plt.ylabel("Frequency")
+plt.title("Error Distribution")
+plt.grid(True)
+plt.show()
+
+# 4 Time Series Comparison
+plt.figure()
+plt.plot(y_test.values, label="Actual", alpha=0.8)
+plt.plot(y_pred, label="Predicted", alpha=0.8)
+plt.xlabel("Test Sample Index")
+plt.ylabel("Current (A)")
+plt.title("Time Series Prediction Comparison")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# 5 Feature Importance
+imp = model.feature_importances_
+plt.figure()
+plt.barh(features, imp)
+plt.xlabel("Importance Score")
+plt.title("Feature Importance (XGBoost)")
+plt.grid(True)
+plt.show()
+
+# 6 Permutation Importance
+perm = permutation_importance(model, X_test, y_test, n_repeats=10, random_state=42)
+plt.figure()
+plt.barh(features, perm.importances_mean)
+plt.xlabel("Mean Importance")
+plt.title("Permutation Importance")
+plt.grid(True)
+plt.show()
+
+# 7 Binned Heatmap
+bins = 20
+heat, _, _ = np.histogram2d(y_test, y_pred, bins=bins)
+plt.figure()
+sns.heatmap(heat.T, cmap="viridis", cbar_kws={'label': 'Count'})
+plt.xlabel("Actual Current (A)")
+plt.ylabel("Predicted Current (A)")
+plt.title("Binned Actual vs Predicted Heatmap")
+plt.show()
+
+# 8 Error vs Actual
+plt.figure()
+plt.scatter(y_test, residuals, alpha=0.6)
+plt.axhline(0, color='r', linestyle='--')
+plt.xlabel("Actual Current (A)")
+plt.ylabel("Residual (A)")
+plt.title("Error vs Actual Current")
+plt.grid(True)
+plt.show()
+
+# 9 Error vs Predicted
+plt.figure()
+plt.scatter(y_pred, residuals, alpha=0.6)
+plt.axhline(0, color='r', linestyle='--')
+plt.xlabel("Predicted Current (A)")
+plt.ylabel("Residual (A)")
+plt.title("Error vs Predicted Current")
+plt.grid(True)
+plt.show()
+
+# 10 SHAP Summary
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test.iloc[:200])
+shap.summary_plot(shap_values, X_test.iloc[:200], plot_type="bar", show=True)
+shap.summary_plot(shap_values, X_test.iloc[:200], show=True)
+
+# 11 Sensitivity Plots (first 3 features)
+for i in range(min(3, len(features))):
+    plt.figure()
+    plt.scatter(X_test.iloc[:, i], y_pred, alpha=0.6)
+    plt.xlabel(features[i])
+    plt.ylabel("Predicted Current (A)")
+    plt.title(f"Sensitivity Analysis: {features[i]}")
+    plt.grid(True)
+    plt.show()
+
+# 12 3D Response Surface
+from mpl_toolkits.mplot3d import Axes3D
+f1, f2 = features[0], features[1]
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+scatter = ax.scatter(X_test[f1], X_test[f2], y_pred, c=y_pred, cmap='viridis', alpha=0.7)
+ax.set_xlabel(f1)
+ax.set_ylabel(f2)
+ax.set_zlabel("Predicted Current (A)")
+plt.title("3D Response Surface (Predicted Current)")
+fig.colorbar(scatter, ax=ax, label='Predicted Current (A)')
+plt.show()
+
+# 13 3D Error Surface
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+scatter = ax.scatter(X_test[f1], X_test[f2], residuals, c=residuals, cmap='coolwarm', alpha=0.7)
+ax.set_xlabel(f1)
+ax.set_ylabel(f2)
+ax.set_zlabel("Residual (A)")
+plt.title("3D Error Surface")
+fig.colorbar(scatter, ax=ax, label='Residual (A)')
+plt.show()
+
+# 14 Correlation Matrix
+plt.figure(figsize=(12, 10))
+sns.heatmap(df[features + [target]].corr(), annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5)
+plt.title("Correlation Matrix of Features and Target")
+plt.show()
+
+# 15-18 Distributions and Error Trends (with clear titles)
+plt.figure()
+plt.hist(y_pred, bins=30, edgecolor='black', alpha=0.7)
+plt.xlabel("Predicted Current (A)")
+plt.ylabel("Frequency")
+plt.title("Predicted Current Distribution")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.hist(y_test, bins=30, edgecolor='black', alpha=0.7)
+plt.xlabel("Actual Current (A)")
+plt.ylabel("Frequency")
+plt.title("Actual Current Distribution")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(np.abs(residuals), marker='o', linestyle='-', alpha=0.7)
+plt.xlabel("Test Sample Index")
+plt.ylabel("Absolute Error (A)")
+plt.title("Absolute Error Trend Across Test Samples")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(np.cumsum(np.abs(residuals)), color='darkred')
+plt.xlabel("Test Sample Index")
+plt.ylabel("Cumulative Absolute Error (A)")
+plt.title("Cumulative Absolute Error Trend")
+plt.grid(True)
+plt.show()
+
+print("\nAll visualizations completed successfully.")
