@@ -1,0 +1,1102 @@
+"""
+PEM Fuel Cell — Anode Stack Flow Prediction
+============================================
+TARGET  : total_anode_stack_flow (NLPM)
+INPUTS  : 16 raw sensor columns + 8 auto-derived physics features
+MODEL   : PEMNet — ResNet-style residual blocks (GELU + BatchNorm1d)
+PIPELINE:
+  1. Load & parse CSV
+  2. Feature engineering (8 derived physics features)
+  3. Train / Val / Test split  (70 / 15 / 15)
+  4. RobustScaler normalisation
+  5. Hyperparameter grid search  (5 configs × 30 epochs)
+  6. Full training  (up to 200 epochs, early stopping, CosineAnnealingLR)
+  7. Test evaluation  (MAE, RMSE, R², SMAPE, RMSSE, tolerance %)
+  8. 18 diagnostic plots   → ./plots/
+  9.  6 SHAP plots          → ./plots/shap_*.png
+ 10. Interactive prediction  → 5 per-sample analysis plots
+
+REQUIREMENTS
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  pip install pandas numpy scikit-learn matplotlib seaborn scipy shap
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from scipy import stats
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+
+warnings.filterwarnings('ignore')
+os.makedirs('plots', exist_ok=True)
+
+print('=' * 80)
+print('PEM Fuel Cell — Anode Stack Flow Prediction')
+print('18 Diagnostic Plots  +  6 SHAP Plots  +  Interactive Prediction')
+print('=' * 80)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  LOAD DATA
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[1/10] Loading dataset ...')
+df = pd.read_csv('1000_h.csv', skiprows=3, header=None, low_memory=False)
+df = df.iloc[:, 1:18]           # drop leading index column, keep 17 data cols
+
+COLUMN_NAMES = [
+    'time', 'current', 'voltage', 'power',
+    'pressure_anode_inlet',    'pressure_anode_outlet',
+    'pressure_cathode_inlet',  'pressure_cathode_outlet',
+    'temp_anode_endplate',     'temp_anode_dewpoint_water',
+    'temp_anode_inlet',        'temp_anode_outlet',
+    'temp_cathode_dewpoint_water', 'temp_cathode_inlet', 'temp_cathode_outlet',
+    'total_anode_stack_flow',  'total_cathode_stack_flow',
+]
+df.columns = COLUMN_NAMES
+df = df.apply(pd.to_numeric, errors='coerce').dropna()
+
+TARGET = 'total_anode_stack_flow'
+print(f'   Dataset shape  : {df.shape[0]:,} rows × {df.shape[1]} cols')
+print(f'   Target range   : [{df[TARGET].min():.4f}, {df[TARGET].max():.4f}] NLPM')
+print(f'   Target unique  : {df[TARGET].nunique()} discrete levels')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[2/10] Engineering physics features ...')
+df['pressure_anode_diff']    = df['pressure_anode_inlet']    - df['pressure_anode_outlet']
+df['pressure_cathode_diff']  = df['pressure_cathode_inlet']  - df['pressure_cathode_outlet']
+df['temp_anode_diff']        = df['temp_anode_outlet']        - df['temp_anode_inlet']
+df['temp_cathode_diff']      = df['temp_cathode_outlet']      - df['temp_cathode_inlet']
+df['anode_superheat']        = df['temp_anode_inlet']         - df['temp_anode_dewpoint_water']
+df['cathode_superheat']      = df['temp_cathode_inlet']       - df['temp_cathode_dewpoint_water']
+df['power_per_volt']         = df['power'] / (df['voltage'].abs() + 1e-9)
+df['current_times_flow']     = df['current'] * df['total_cathode_stack_flow']
+
+FEATURE_COLS = [
+    # raw sensor readings
+    'time', 'current', 'voltage', 'power',
+    'pressure_anode_inlet',    'pressure_anode_outlet',
+    'pressure_cathode_inlet',  'pressure_cathode_outlet',
+    'temp_anode_endplate',     'temp_anode_dewpoint_water',
+    'temp_anode_inlet',        'temp_anode_outlet',
+    'temp_cathode_dewpoint_water', 'temp_cathode_inlet', 'temp_cathode_outlet',
+    'total_cathode_stack_flow',
+    # engineered
+    'pressure_anode_diff',   'pressure_cathode_diff',
+    'temp_anode_diff',       'temp_cathode_diff',
+    'anode_superheat',       'cathode_superheat',
+    'power_per_volt',        'current_times_flow',
+]
+
+X = df[FEATURE_COLS]
+y = df[TARGET]
+
+# store ranges for interactive input validation
+param_ranges = {c: (float(X[c].min()), float(X[c].max())) for c in FEATURE_COLS}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  DATA SPLIT  &  SCALING
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[3/10] Splitting and scaling data ...')
+X_tr_full, X_te, y_tr_full, y_te = train_test_split(X, y, test_size=0.15, random_state=42)
+X_tr,      X_v,  y_tr,      y_v  = train_test_split(X_tr_full, y_tr_full,
+                                                     test_size=0.15, random_state=42)
+
+scaler   = RobustScaler()
+X_tr_s   = scaler.fit_transform(X_tr)
+X_v_s    = scaler.transform(X_v)
+X_te_s   = scaler.transform(X_te)
+
+print(f'   Train : {len(X_tr_s):,}  |  Val : {len(X_v_s):,}  |  Test : {len(X_te_s):,}')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  GPU CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[4/10] Setting up device ...')
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32       = True
+    torch.backends.cudnn.benchmark        = True
+    torch.backends.cudnn.deterministic    = False
+    gpu   = torch.cuda.get_device_properties(0)
+    VRAM  = gpu.total_memory / 1e9
+    AUTO_BATCH = 2048 if VRAM < 6 else (4096 if VRAM < 12 else 8192)
+    USE_AMP    = True
+    amp_scaler = torch.cuda.amp.GradScaler()
+    print(f'   GPU      : {gpu.name}')
+    print(f'   VRAM     : {VRAM:.1f} GB  →  batch = {AUTO_BATCH}')
+    print(f'   AMP      : enabled (float16 mixed precision)')
+else:
+    device     = torch.device('cpu')
+    USE_AMP    = False
+    amp_scaler = None
+    AUTO_BATCH = 2048
+    print('   No CUDA GPU found — running on CPU')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  MODEL DEFINITION
+# ─────────────────────────────────────────────────────────────────────────────
+class ResidualBlock(nn.Module):
+    """ResNet-style block: skip connection + BN + GELU + Dropout"""
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+class PEMNet(nn.Module):
+    """Residual NN for PEM fuel-cell anode flow regression."""
+    def __init__(self, input_dim: int, hidden: int = 768,
+                 n_res: int = 4, dropout: float = 0.15):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden),
+            nn.GELU(), nn.Dropout(dropout),
+        )
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(hidden, dropout) for _ in range(n_res)]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 128), nn.GELU(), nn.Linear(128, 1),
+        )
+
+    def forward(self, x):
+        return self.head(self.res_blocks(self.stem(x)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  DATA LOADERS
+# ─────────────────────────────────────────────────────────────────────────────
+PIN      = torch.cuda.is_available()
+N_WORKERS = 4 if torch.cuda.is_available() else 0
+
+def make_loader(X_arr, y_ser, shuffle=True, batch=None):
+    if batch is None:
+        batch = AUTO_BATCH
+    ds = TensorDataset(
+        torch.tensor(X_arr, dtype=torch.float32),
+        torch.tensor(y_ser.values, dtype=torch.float32).unsqueeze(1),
+    )
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle,
+                      pin_memory=PIN, num_workers=N_WORKERS,
+                      persistent_workers=(N_WORKERS > 0))
+
+train_loader = make_loader(X_tr_s, y_tr)
+val_loader   = make_loader(X_v_s,  y_v,  shuffle=False)
+test_loader  = make_loader(X_te_s, y_te, shuffle=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  TRAINING HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+PATIENCE = 10
+
+def run_training(params: dict, epochs: int, verbose: bool = False):
+    m   = PEMNet(X_tr_s.shape[1], params['hidden'],
+                 params['n_res'],  params['dropout']).to(device)
+    opt  = optim.AdamW(m.parameters(), lr=params['lr'], weight_decay=params['wd'])
+    sch  = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    crit = nn.HuberLoss(delta=1.0)
+
+    best_val_mae = float('inf')
+    best_state   = None
+    pat_cnt      = 0
+    history      = {'train_loss': [], 'val_mae': [], 'val_r2': []}
+
+    for epoch in range(1, epochs + 1):
+        m.train()
+        total_loss = 0.0
+        for bx, by in train_loader:
+            bx = bx.to(device, non_blocking=True)
+            by = by.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            if USE_AMP:
+                with torch.cuda.amp.autocast():
+                    loss = crit(m(bx), by)
+                amp_scaler.scale(loss).backward()
+                amp_scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                amp_scaler.step(opt); amp_scaler.update()
+            else:
+                loss = crit(m(bx), by)
+                loss.backward()
+                nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                opt.step()
+            total_loss += loss.item()
+        sch.step()
+
+        # ── validation ──────────────────────────────────────────────
+        m.eval()
+        pv = []
+        with torch.no_grad():
+            for bx, _ in val_loader:
+                bx = bx.to(device, non_blocking=True)
+                if USE_AMP:
+                    with torch.cuda.amp.autocast():
+                        pv.append(m(bx).cpu().numpy())
+                else:
+                    pv.append(m(bx).cpu().numpy())
+        pv       = np.concatenate(pv).flatten()
+        val_mae  = mean_absolute_error(y_v, pv)
+        val_r2   = r2_score(y_v, pv)
+
+        history['train_loss'].append(total_loss / len(train_loader))
+        history['val_mae'].append(val_mae)
+        history['val_r2'].append(val_r2)
+
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            best_state   = {k: v.cpu().clone() for k, v in m.state_dict().items()}
+            pat_cnt      = 0
+        else:
+            pat_cnt += 1
+            if pat_cnt >= PATIENCE:
+                if verbose:
+                    print(f'      Early stop at epoch {epoch}')
+                break
+
+        if verbose and epoch % 10 == 0:
+            print(f'      Ep {epoch:3d}  loss={total_loss/len(train_loader):.4f}'
+                  f'  val_MAE={val_mae:.4f}  val_R²={val_r2:.6f}')
+
+    m.load_state_dict(best_state)
+    return m, best_val_mae, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  HYPERPARAMETER GRID SEARCH
+# ─────────────────────────────────────────────────────────────────────────────
+GRID = [
+    {'hidden': 512,  'n_res': 3, 'dropout': 0.10, 'lr': 5e-4, 'wd': 1e-5},
+    {'hidden': 512,  'n_res': 4, 'dropout': 0.15, 'lr': 3e-4, 'wd': 1e-5},
+    {'hidden': 768,  'n_res': 4, 'dropout': 0.15, 'lr': 3e-4, 'wd': 1e-5},
+    {'hidden': 768,  'n_res': 5, 'dropout': 0.10, 'lr': 2e-4, 'wd': 1e-6},
+    {'hidden': 1024, 'n_res': 5, 'dropout': 0.15, 'lr': 2e-4, 'wd': 1e-6},
+]
+TUNE_EPOCHS  = 30
+FINAL_EPOCHS = 200
+
+print('\n' + '=' * 70)
+print('[5/10] HYPERPARAMETER TUNING  (5 configs × up to 30 epochs each)')
+print('=' * 70)
+
+best_mae      = float('inf')
+best_params   = None
+best_state_hp = None
+
+for i, p in enumerate(GRID):
+    print(f'\n  [{i+1}/5]  hidden={p["hidden"]}  n_res={p["n_res"]}'
+          f'  dropout={p["dropout"]}  lr={p["lr"]}')
+    m_tmp, val_mae_tmp, _ = run_training(p, TUNE_EPOCHS, verbose=False)
+    print(f'         Val MAE = {val_mae_tmp:.4f} NLPM')
+    if val_mae_tmp < best_mae:
+        best_mae      = val_mae_tmp
+        best_params   = p
+        best_state_hp = {k: v.clone() for k, v in m_tmp.state_dict().items()}
+
+print(f'\n  Best config : {best_params}')
+print(f'  Tuning Val MAE = {best_mae:.4f} NLPM')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  FULL TRAINING
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n' + '=' * 70)
+print(f'[6/10] FULL TRAINING  (up to {FINAL_EPOCHS} epochs, patience={PATIENCE})')
+print('=' * 70)
+final_model, _, history = run_training(best_params, FINAL_EPOCHS, verbose=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10.  TEST EVALUATION
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[7/10] Evaluating on held-out test set ...')
+final_model.eval()
+preds_all = []
+with torch.no_grad():
+    for bx, _ in test_loader:
+        bx = bx.to(device, non_blocking=True)
+        if USE_AMP:
+            with torch.cuda.amp.autocast():
+                preds_all.append(final_model(bx).cpu().numpy())
+        else:
+            preds_all.append(final_model(bx).cpu().numpy())
+
+preds_test  = np.concatenate(preds_all).flatten()
+y_test_arr  = y_te.values
+residuals   = y_test_arr - preds_test
+
+mae      = mean_absolute_error(y_test_arr, preds_test)
+rmse     = float(np.sqrt(mean_squared_error(y_test_arr, preds_test)))
+r2       = r2_score(y_test_arr, preds_test)
+medae    = float(np.median(np.abs(residuals)))
+smape    = float(np.mean(2 * np.abs(residuals) /
+                         (np.abs(y_test_arr) + np.abs(preds_test) + 1e-9)) * 100)
+naive_rmse = float(np.sqrt(np.mean((y_test_arr - y_test_arr.mean()) ** 2)))
+rmsse    = rmse / (naive_rmse + 1e-9)
+w005     = float(np.mean(np.abs(residuals) <= 0.05) * 100)
+w010     = float(np.mean(np.abs(residuals) <= 0.10) * 100)
+
+print('\n' + '=' * 70)
+print('TEST SET RESULTS')
+print('=' * 70)
+print(f'  MAE            = {mae:.4f} NLPM')
+print(f'  Median AE      = {medae:.4f} NLPM')
+print(f'  RMSE           = {rmse:.4f} NLPM')
+print(f'  R²             = {r2:.6f}')
+print(f'  SMAPE          = {smape:.2f}%')
+print(f'  RMSSE          = {rmsse:.4f}')
+print(f'  Within ±0.05   = {w005:.1f}%')
+print(f'  Within ±0.10   = {w010:.1f}%')
+print('=' * 70)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11.  SAVE CHECKPOINT
+# ─────────────────────────────────────────────────────────────────────────────
+torch.save({
+    'model_state': final_model.state_dict(),
+    'best_params': best_params,
+    'scaler':      scaler,
+    'feature_cols': FEATURE_COLS,
+    'target':      TARGET,
+    'metrics':     {'mae': mae, 'medae': medae, 'rmse': rmse, 'r2': r2,
+                    'smape': smape, 'rmsse': rmsse,
+                    'within_005_pct': w005, 'within_010_pct': w010},
+}, 'pem_anode_flow_model.pt')
+print('\nCheckpoint saved → pem_anode_flow_model.pt')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12.  18 ANALYSIS PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[8/10] Generating 18 analysis plots ...')
+
+BLUE  = '#2196F3'
+RED   = '#F44336'
+GREEN = '#4CAF50'
+GRAY  = '#90A4AE'
+
+sample = df.sample(min(20_000, len(df)), random_state=42)
+
+
+# ── 01  Predicted vs Actual ───────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 7))
+ax.scatter(y_test_arr, preds_test, alpha=0.25, s=4, color=BLUE)
+lo, hi = y_test_arr.min(), y_test_arr.max()
+ax.plot([lo, hi], [lo, hi], 'r--', lw=2, label='Ideal')
+ax.set_xlabel('Actual Anode Flow (NLPM)')
+ax.set_ylabel('Predicted Anode Flow (NLPM)')
+ax.set_title(f'Predicted vs Actual  |  R²={r2:.5f}  MAE={mae:.4f} NLPM')
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/01_pred_vs_actual.png', dpi=150); plt.close()
+
+
+# ── 02  Residuals vs Predicted ───────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.scatter(preds_test, residuals, alpha=0.25, s=4, color=RED)
+ax.axhline(0, color='black', lw=1.5, linestyle='--')
+ax.set_xlabel('Predicted Anode Flow (NLPM)')
+ax.set_ylabel('Residual (NLPM)')
+ax.set_title('Residuals vs Predicted'); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/02_residuals_vs_pred.png', dpi=150); plt.close()
+
+
+# ── 03  Residual Histogram ───────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 5))
+sns.histplot(residuals, bins=80, kde=True, ax=ax, color=BLUE)
+ax.axvline(0, color='red', lw=2, linestyle='--')
+ax.set_xlabel('Residual (NLPM)'); ax.set_title('Residual Distribution')
+plt.tight_layout(); plt.savefig('plots/03_residual_dist.png', dpi=150); plt.close()
+
+
+# ── 04  Training Loss ────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.plot(history['train_loss'], color=BLUE, lw=2)
+ax.set_xlabel('Epoch'); ax.set_ylabel('Huber Loss')
+ax.set_title('Training Loss Curve'); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/04_train_loss.png', dpi=150); plt.close()
+
+
+# ── 05  Val MAE & R² dual axis ───────────────────────────────────────────────
+fig, ax1 = plt.subplots(figsize=(9, 5))
+ax1.plot(history['val_mae'], color=RED, lw=2, label='Val MAE')
+ax1.set_xlabel('Epoch'); ax1.set_ylabel('MAE (NLPM)', color=RED)
+ax2 = ax1.twinx()
+ax2.plot(history['val_r2'], color=GREEN, lw=2, label='Val R²')
+ax2.set_ylabel('R²', color=GREEN)
+ax1.set_title('Validation Metrics over Epochs'); ax1.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/05_val_metrics.png', dpi=150); plt.close()
+
+
+# ── 06  Correlation Heatmap ──────────────────────────────────────────────────
+heat_cols = [TARGET, 'current', 'voltage', 'power',
+             'pressure_anode_diff', 'pressure_cathode_diff',
+             'anode_superheat',     'cathode_superheat',
+             'temp_anode_endplate', 'temp_cathode_inlet',
+             'total_cathode_stack_flow', 'power_per_volt', 'current_times_flow']
+corr = df[heat_cols].corr()
+fig, ax = plt.subplots(figsize=(13, 10))
+mask = np.triu(np.ones_like(corr, dtype=bool))
+sns.heatmap(corr, mask=mask, annot=True, fmt='.2f', cmap='coolwarm',
+            linewidths=0.5, annot_kws={'size': 8}, ax=ax)
+ax.set_title('Feature Correlation Heatmap', fontsize=14)
+plt.tight_layout(); plt.savefig('plots/06_correlation_heatmap.png', dpi=150); plt.close()
+
+
+# ── 07  Feature Importance (Permutation) ─────────────────────────────────────
+from sklearn.inspection import permutation_importance
+from sklearn.base import BaseEstimator, RegressorMixin
+
+class TorchWrapper(BaseEstimator, RegressorMixin):
+    def fit(self, X, y): return self
+    def predict(self, X):
+        final_model.eval()
+        with torch.no_grad():
+            return final_model(
+                torch.tensor(X, dtype=torch.float32).to(device)
+            ).cpu().numpy().flatten()
+
+n_samp = min(8_000, len(X_te_s))
+idx    = np.random.choice(len(X_te_s), n_samp, replace=False)
+perm   = permutation_importance(TorchWrapper(), X_te_s[idx], y_te.values[idx],
+                                n_repeats=5, random_state=42,
+                                scoring='neg_mean_absolute_error')
+fi = pd.Series(perm.importances_mean, index=FEATURE_COLS).sort_values()
+fig, ax = plt.subplots(figsize=(9, 11))
+fi.plot(kind='barh', ax=ax, color=BLUE, edgecolor='white')
+ax.set_xlabel('Permutation Importance  (MAE Δ)')
+ax.set_title('Feature Importance (Permutation)'); ax.grid(alpha=0.3, axis='x')
+plt.tight_layout(); plt.savefig('plots/07_feature_importance.png', dpi=150); plt.close()
+
+
+# ── 08  Error by Anode Flow Level ────────────────────────────────────────────
+err_df = pd.DataFrame({'actual': y_test_arr, 'abs_err': np.abs(residuals)})
+ebl    = err_df.groupby('actual')['abs_err'].mean().reset_index()
+fig, ax = plt.subplots(figsize=(12, 5))
+ax.bar(ebl['actual'], ebl['abs_err'], width=0.002, color=RED, alpha=0.8)
+ax.set_xlabel('Anode Flow Level (NLPM)')
+ax.set_ylabel('Mean |Error| (NLPM)')
+ax.set_title('Mean Absolute Error by Anode Flow Level'); ax.grid(alpha=0.3, axis='y')
+plt.tight_layout(); plt.savefig('plots/08_error_by_level.png', dpi=150); plt.close()
+
+
+# ── 09  Error Violin by Level ────────────────────────────────────────────────
+err_df2 = pd.DataFrame({'flow_level': y_test_arr.round(3), 'error': residuals})
+levels_sorted = sorted(err_df2['flow_level'].unique())
+data_by_level = [err_df2.loc[err_df2['flow_level'] == lv, 'error'].values
+                 for lv in levels_sorted]
+fig, ax = plt.subplots(figsize=(16, 6))
+parts = ax.violinplot(data_by_level, positions=range(len(levels_sorted)),
+                      showmedians=True, showextrema=True, widths=0.7)
+for pc in parts['bodies']:
+    pc.set_facecolor(BLUE); pc.set_alpha(0.6)
+parts['cmedians'].set_color(RED); parts['cmedians'].set_linewidth(2)
+ax.axhline(0, color='black', lw=1.2, linestyle='--', alpha=0.7)
+ax.set_xticks(range(len(levels_sorted)))
+ax.set_xticklabels([f'{v:.3f}' for v in levels_sorted],
+                   rotation=45, ha='right', fontsize=8)
+ax.set_xlabel('Anode Flow Level (NLPM)')
+ax.set_ylabel('Prediction Error (NLPM)')
+ax.set_title('Prediction Error Distribution by Level (Violin)')
+ax.grid(alpha=0.3, axis='y')
+plt.tight_layout(); plt.savefig('plots/09_error_violin_by_level.png', dpi=150); plt.close()
+
+
+# ── 10  Cathode Flow vs Anode Flow (current colormap) ───────────────────────
+fig, ax = plt.subplots(figsize=(8, 6))
+sc = ax.scatter(sample[TARGET], sample['total_cathode_stack_flow'],
+                c=sample['current'], cmap='plasma', alpha=0.4, s=5)
+plt.colorbar(sc, ax=ax, label='Current (A)')
+ax.set_xlabel('Anode Flow (NLPM)')
+ax.set_ylabel('Cathode Flow (NLPM)')
+ax.set_title('Cathode vs Anode Flow  (coloured by Current)'); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/10_cathode_vs_anode_flow.png', dpi=150); plt.close()
+
+
+# ── 11  Pressure Differentials vs Anode Flow ────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.scatter(sample[TARGET], sample['pressure_anode_diff'],
+           alpha=0.3, s=4, label='Anode ΔP',   color=BLUE)
+ax.scatter(sample[TARGET], sample['pressure_cathode_diff'],
+           alpha=0.3, s=4, label='Cathode ΔP', color=RED)
+ax.set_xlabel('Anode Flow (NLPM)')
+ax.set_ylabel('Pressure Differential (kPag)')
+ax.set_title('Pressure Differentials vs Anode Flow')
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/11_pressure_diff_vs_flow.png', dpi=150); plt.close()
+
+
+# ── 12  Inlet Temperatures vs Anode Flow ────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+axes[0].scatter(sample[TARGET], sample['temp_cathode_inlet'], alpha=0.3, s=4, color=RED)
+axes[0].set_xlabel('Anode Flow (NLPM)'); axes[0].set_ylabel('Temp (°C)')
+axes[0].set_title('Cathode Inlet Temp vs Anode Flow'); axes[0].grid(alpha=0.3)
+axes[1].scatter(sample[TARGET], sample['temp_anode_inlet'],   alpha=0.3, s=4, color=BLUE)
+axes[1].set_xlabel('Anode Flow (NLPM)'); axes[1].set_ylabel('Temp (°C)')
+axes[1].set_title('Anode Inlet Temp vs Anode Flow'); axes[1].grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/12_temp_vs_flow.png', dpi=150); plt.close()
+
+
+# ── 13  Bland–Altman Agreement Plot ─────────────────────────────────────────
+means_ba   = (y_test_arr + preds_test) / 2
+mean_diff  = np.mean(residuals)
+std_diff   = np.std(residuals)
+loa_up     = mean_diff + 1.96 * std_diff
+loa_dn     = mean_diff - 1.96 * std_diff
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.scatter(means_ba, residuals, alpha=0.2, s=4, color=BLUE)
+ax.axhline(mean_diff, color=RED,   lw=2,   linestyle='-',
+           label=f'Mean bias = {mean_diff:.4f} NLPM')
+ax.axhline(loa_up,   color=GREEN, lw=1.5, linestyle='--',
+           label=f'+1.96 SD = {loa_up:.4f} NLPM')
+ax.axhline(loa_dn,   color=GREEN, lw=1.5, linestyle='--',
+           label=f'−1.96 SD = {loa_dn:.4f} NLPM')
+ax.fill_between([means_ba.min(), means_ba.max()], loa_dn, loa_up,
+                alpha=0.08, color=GREEN)
+ax.set_xlabel('Mean of Actual & Predicted (NLPM)')
+ax.set_ylabel('Actual − Predicted (NLPM)')
+ax.set_title('Bland–Altman Agreement Plot')
+ax.legend(fontsize=9); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/13_bland_altman.png', dpi=150); plt.close()
+
+
+# ── 14  Q-Q Plot of Residuals ────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 7))
+stats.probplot(residuals, dist='norm', plot=ax)
+ax.set_title('Q-Q Plot of Residuals'); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/14_qq_residuals.png', dpi=150); plt.close()
+
+
+# ── 15  Absolute Error CDF ───────────────────────────────────────────────────
+abs_e   = np.sort(np.abs(residuals))
+cdf_arr = np.arange(1, len(abs_e) + 1) / len(abs_e)
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(abs_e, cdf_arr, color=BLUE, lw=2)
+ax.axvline(mae,  color=RED,   lw=2, linestyle='--', label=f'MAE  = {mae:.4f} NLPM')
+ax.axvline(rmse, color=GREEN, lw=2, linestyle='--', label=f'RMSE = {rmse:.4f} NLPM')
+ax.set_xlabel('Absolute Error (NLPM)'); ax.set_ylabel('CDF')
+ax.set_title('CDF of Absolute Errors'); ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('plots/15_abs_error_cdf.png', dpi=150); plt.close()
+
+
+# ── 16  Time-Series Segment ──────────────────────────────────────────────────
+n_seg  = min(600, len(y_test_arr))
+t_axis = np.arange(n_seg)
+fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                         gridspec_kw={'height_ratios': [3, 1]})
+axes[0].plot(t_axis, y_test_arr[:n_seg],  color=BLUE,  lw=1.2, label='Actual',    alpha=0.9)
+axes[0].plot(t_axis, preds_test[:n_seg],  color=RED,   lw=1.0, label='Predicted', alpha=0.8,
+             linestyle='--')
+axes[0].set_ylabel('Anode Flow (NLPM)')
+axes[0].set_title('Actual vs Predicted — Time-Series Segment')
+axes[0].legend(loc='upper right'); axes[0].grid(alpha=0.3)
+axes[1].fill_between(t_axis, residuals[:n_seg], 0,
+                     where=(residuals[:n_seg] >= 0), color=GREEN, alpha=0.6, label='Over')
+axes[1].fill_between(t_axis, residuals[:n_seg], 0,
+                     where=(residuals[:n_seg] < 0),  color=RED,   alpha=0.6, label='Under')
+axes[1].axhline(0, color='black', lw=0.8)
+axes[1].set_ylabel('Error (NLPM)'); axes[1].set_xlabel('Sample index')
+axes[1].legend(loc='upper right', fontsize=8); axes[1].grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig('plots/16_timeseries_actual_vs_pred.png', dpi=150); plt.close()
+
+
+# ── 17  Metric Summary Bar Chart ─────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+met_l  = {'MAE (NLPM)': mae, 'Median AE': medae, 'RMSE (NLPM)': rmse}
+bars_l = axes[0].bar(met_l.keys(), met_l.values(),
+                     color=[BLUE, GREEN, RED], alpha=0.85, edgecolor='white')
+for b, v in zip(bars_l, met_l.values()):
+    axes[0].text(b.get_x() + b.get_width() / 2, b.get_height() + 0.0001,
+                 f'{v:.4f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+axes[0].set_title('Absolute Error Metrics', fontsize=13); axes[0].grid(alpha=0.3, axis='y')
+
+met_r   = {'R²': r2, 'SMAPE (%)': smape, 'RMSSE': rmsse,
+           '±0.05 %': w005, '±0.10 %': w010}
+colors_r = [BLUE, RED, GRAY, GREEN, '#FF9800']
+bars_r   = axes[1].bar(met_r.keys(), met_r.values(),
+                       color=colors_r, alpha=0.85, edgecolor='white')
+for b, v in zip(bars_r, met_r.values()):
+    axes[1].text(b.get_x() + b.get_width() / 2, b.get_height() + 0.001,
+                 f'{v:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+axes[1].set_title('Scale-Free & Tolerance Metrics', fontsize=13)
+axes[1].grid(alpha=0.3, axis='y'); axes[1].tick_params(axis='x', labelsize=9)
+plt.suptitle('Model Performance Summary — Anode Flow Prediction',
+             fontsize=14, y=1.01)
+plt.tight_layout()
+plt.savefig('plots/17_metric_summary.png', dpi=150, bbox_inches='tight'); plt.close()
+
+
+# ── 18  MAE Heatmap — Current × Cathode Flow ────────────────────────────────
+test_feat_df = pd.DataFrame(X_te.values, columns=FEATURE_COLS)
+test_feat_df['abs_err'] = np.abs(residuals)
+c_bins       = pd.cut(test_feat_df['current'],                 bins=12)
+f_bins       = pd.cut(test_feat_df['total_cathode_stack_flow'], bins=12)
+heat_pivot   = (test_feat_df
+                .assign(c_bin=c_bins, f_bin=f_bins)
+                .groupby(['f_bin', 'c_bin'], observed=False)['abs_err']
+                .mean()
+                .unstack())
+fig, ax = plt.subplots(figsize=(13, 7))
+sns.heatmap(heat_pivot, ax=ax, cmap='YlOrRd', annot=False,
+            linewidths=0.3, linecolor='#e0e0e0',
+            cbar_kws={'label': 'Mean Absolute Error (NLPM)'})
+ax.set_xlabel('Current bin (A)', fontsize=12)
+ax.set_ylabel('Cathode Flow bin (NLPM)', fontsize=12)
+ax.set_title('MAE Heatmap: Model Error by Operating Region\n'
+             '(Current × Cathode Stack Flow)', fontsize=13)
+ax.set_xticklabels(ax.get_xticklabels(), rotation=35, ha='right', fontsize=7)
+ax.set_yticklabels(ax.get_yticklabels(), rotation=0,  fontsize=7)
+plt.tight_layout()
+plt.savefig('plots/18_error_heatmap_current_cathode.png', dpi=150); plt.close()
+
+print('  All 18 plots saved → ./plots/  (01 – 18)')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13.  SHAP ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[9/10] Running SHAP analysis ...')
+shap.initjs()
+
+N_BG   = 300
+N_EXPL = 1000
+rng    = np.random.default_rng(42)
+bg_idx   = rng.choice(len(X_tr_s),  N_BG,   replace=False)
+expl_idx = rng.choice(len(X_te_s),  N_EXPL, replace=False)
+
+background = torch.tensor(X_tr_s[bg_idx],   dtype=torch.float32).to(device)
+expl_data  = torch.tensor(X_te_s[expl_idx], dtype=torch.float32).to(device)
+
+final_model.eval()
+explainer   = shap.DeepExplainer(final_model, background)
+shap_values = explainer.shap_values(expl_data)
+
+if isinstance(shap_values, list):
+    shap_values = shap_values[0]
+shap_values = np.array(shap_values)
+if shap_values.ndim == 3:
+    shap_values = shap_values[:, :, 0]
+if shap_values.shape[0] == 1 and shap_values.ndim == 2:
+    shap_values = shap_values.squeeze(0)
+
+expl_data_raw = X_te.iloc[expl_idx].values
+base_val      = float(np.atleast_1d(explainer.expected_value)[0])
+
+expl_obj = shap.Explanation(
+    values      = shap_values,
+    base_values = np.full(N_EXPL, base_val),
+    data        = expl_data_raw,
+    feature_names = FEATURE_COLS,
+)
+print(f'  SHAP computed for {N_EXPL} samples over {len(FEATURE_COLS)} features.')
+
+
+# ── SHAP 1  Beeswarm ─────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 9))
+shap.plots.beeswarm(expl_obj, max_display=20, show=False)
+plt.title('SHAP Beeswarm — Global Feature Impact on Anode Flow Prediction',
+          fontsize=12)
+plt.tight_layout()
+plt.savefig('plots/shap_01_beeswarm.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ shap_01_beeswarm.png')
+
+
+# ── SHAP 2  Mean |SHAP| Bar ──────────────────────────────────────────────────
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+shap_series   = pd.Series(mean_abs_shap, index=FEATURE_COLS).sort_values(ascending=True)
+fig, ax = plt.subplots(figsize=(9, 10))
+colors_shap = plt.cm.RdBu_r(np.linspace(0.15, 0.85, len(shap_series)))
+bars = ax.barh(shap_series.index, shap_series.values,
+               color=colors_shap, edgecolor='white', linewidth=0.4)
+ax.set_xlabel('Mean |SHAP value| (average impact on predicted anode flow, NLPM)',
+              fontsize=11)
+ax.set_title('SHAP Feature Importance — Mean Absolute Shapley Value', fontsize=13)
+ax.grid(alpha=0.3, axis='x')
+for bar, val in zip(bars, shap_series.values):
+    ax.text(val + shap_series.values.max() * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f'{val:.4f}', va='center', fontsize=8)
+plt.tight_layout()
+plt.savefig('plots/shap_02_bar_mean_abs.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ shap_02_bar_mean_abs.png')
+
+
+# ── SHAP 3  Dependence plots — top 4 features ────────────────────────────────
+top4 = pd.Series(mean_abs_shap, index=FEATURE_COLS).nlargest(4).index.tolist()
+fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+for ax_i, feat in zip(axes.flatten(), top4):
+    fi = FEATURE_COLS.index(feat)
+    interact_scores = [
+        abs(np.corrcoef(shap_values[:, fi], expl_data_raw[:, j])[0, 1])
+        for j in range(len(FEATURE_COLS)) if j != fi
+    ]
+    ii = int(np.argmax(interact_scores))
+    if ii >= fi:
+        ii += 1
+    sc = ax_i.scatter(expl_data_raw[:, fi], shap_values[:, fi],
+                      c=expl_data_raw[:, ii], cmap='coolwarm', alpha=0.5, s=8)
+    plt.colorbar(sc, ax=ax_i, label=FEATURE_COLS[ii], pad=0.02)
+    ax_i.axhline(0, color='black', lw=0.8, linestyle='--')
+    ax_i.set_xlabel(feat, fontsize=10)
+    ax_i.set_ylabel(f'SHAP({feat})', fontsize=10)
+    ax_i.set_title(f'Dependence: {feat}\n(colour = {FEATURE_COLS[ii]})', fontsize=10)
+    ax_i.grid(alpha=0.3)
+plt.suptitle('SHAP Dependence Plots — Top 4 Features', fontsize=13, y=1.01)
+plt.tight_layout()
+plt.savefig('plots/shap_03_dependence_top4.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ shap_03_dependence_top4.png')
+
+
+# ── SHAP 4  Heatmap ──────────────────────────────────────────────────────────
+pred_order   = np.argsort(final_model(expl_data).detach().cpu().numpy().flatten())
+shap_sorted  = shap_values[pred_order, :]
+col_stride   = max(1, N_EXPL // 300)
+shap_display = shap_sorted[::col_stride, :].T
+fig, ax = plt.subplots(figsize=(15, 9))
+im = ax.imshow(shap_display, aspect='auto', cmap='RdBu_r',
+               vmin=-np.percentile(np.abs(shap_display), 97),
+               vmax= np.percentile(np.abs(shap_display), 97))
+plt.colorbar(im, ax=ax,
+             label='SHAP value (contribution to predicted anode flow, NLPM)',
+             pad=0.01)
+ax.set_yticks(range(len(FEATURE_COLS)))
+ax.set_yticklabels(FEATURE_COLS, fontsize=8)
+ax.set_xlabel('Test samples (sorted by predicted anode flow →)', fontsize=11)
+ax.set_title('SHAP Heatmap: Feature Contributions Across Operating Range', fontsize=12)
+plt.tight_layout()
+plt.savefig('plots/shap_04_heatmap.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ shap_04_heatmap.png')
+
+
+# ── SHAP 5  Waterfall — high flow sample ─────────────────────────────────────
+y_expl_preds = final_model(expl_data).detach().cpu().numpy().flatten()
+high_idx     = int(np.argmax(y_expl_preds))
+expl_high    = shap.Explanation(
+    values      = shap_values[high_idx],
+    base_values = base_val,
+    data        = expl_data_raw[high_idx],
+    feature_names = FEATURE_COLS,
+)
+fig, ax = plt.subplots(figsize=(10, 9))
+shap.plots.waterfall(expl_high, max_display=20, show=False)
+plt.title(f'SHAP Waterfall — High Anode Flow Sample\n'
+          f'Predicted: {y_expl_preds[high_idx]:.4f} NLPM  (base: {base_val:.4f} NLPM)',
+          fontsize=11)
+plt.tight_layout()
+plt.savefig('plots/shap_05_waterfall_high_flow.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ shap_05_waterfall_high_flow.png')
+
+
+# ── SHAP 6  Waterfall — low flow sample ──────────────────────────────────────
+low_idx   = int(np.argmin(y_expl_preds))
+expl_low  = shap.Explanation(
+    values      = shap_values[low_idx],
+    base_values = base_val,
+    data        = expl_data_raw[low_idx],
+    feature_names = FEATURE_COLS,
+)
+fig, ax = plt.subplots(figsize=(10, 9))
+shap.plots.waterfall(expl_low, max_display=20, show=False)
+plt.title(f'SHAP Waterfall — Low Anode Flow Sample\n'
+          f'Predicted: {y_expl_preds[low_idx]:.4f} NLPM  (base: {base_val:.4f} NLPM)',
+          fontsize=11)
+plt.tight_layout()
+plt.savefig('plots/shap_06_waterfall_low_flow.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ shap_06_waterfall_low_flow.png')
+
+print('\n  All 6 SHAP plots saved → ./plots/  (shap_01 – shap_06)')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14.  FINAL SUMMARY PRINT
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n' + '=' * 70)
+print('FINAL RESULTS SUMMARY — TARGET: total_anode_stack_flow')
+print('=' * 70)
+print(f'  Architecture    : PEMNet — Residual blocks (GELU + BatchNorm1d)')
+print(f'  Best hyperparams: {best_params}')
+print(f'  Test MAE        : {mae:.4f} NLPM')
+print(f'  Test Median AE  : {medae:.4f} NLPM')
+print(f'  Test RMSE       : {rmse:.4f} NLPM')
+print(f'  Test R²         : {r2:.6f}')
+print(f'  SMAPE           : {smape:.2f}%')
+print(f'  RMSSE           : {rmsse:.4f}')
+print(f'  Within ±0.05    : {w005:.1f}%')
+print(f'  Within ±0.10    : {w010:.1f}%')
+print(f'  Diagnostic plots: 18 → ./plots/01_* … 18_*')
+print(f'  SHAP plots      :  6 → ./plots/shap_01_* … shap_06_*')
+print('=' * 70)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15.  INTERACTIVE PREDICTION
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n[10/10] INTERACTIVE PREDICTION')
+print('=' * 70)
+print('  Enter the 16 raw sensor readings below.')
+print('  total_anode_stack_flow will be PREDICTED — do not enter it.')
+print('  Derived physics features are computed automatically.')
+print('  Allowed range shown in brackets.')
+print('-' * 70)
+
+# ── 16 raw input columns (target excluded) ───────────────────────────────────
+RAW_INPUTS = [
+    'time', 'current', 'voltage', 'power',
+    'pressure_anode_inlet',   'pressure_anode_outlet',
+    'pressure_cathode_inlet', 'pressure_cathode_outlet',
+    'temp_anode_endplate',    'temp_anode_dewpoint_water',
+    'temp_anode_inlet',       'temp_anode_outlet',
+    'temp_cathode_dewpoint_water', 'temp_cathode_inlet', 'temp_cathode_outlet',
+    'total_cathode_stack_flow',
+]
+
+user_raw = {}
+for f in RAW_INPUTS:
+    lo, hi = param_ranges[f]
+    while True:
+        try:
+            val = float(input(f'  → {f:<40} [{lo:.4f} ─ {hi:.4f}]: '))
+            user_raw[f] = val
+            break
+        except (ValueError, EOFError):
+            print('     ⚠  Please enter a valid number.')
+
+# ── auto-derive engineered features ──────────────────────────────────────────
+uv = user_raw
+user_raw['pressure_anode_diff']   = uv['pressure_anode_inlet']      - uv['pressure_anode_outlet']
+user_raw['pressure_cathode_diff'] = uv['pressure_cathode_inlet']    - uv['pressure_cathode_outlet']
+user_raw['temp_anode_diff']       = uv['temp_anode_outlet']          - uv['temp_anode_inlet']
+user_raw['temp_cathode_diff']     = uv['temp_cathode_outlet']        - uv['temp_cathode_inlet']
+user_raw['anode_superheat']       = uv['temp_anode_inlet']           - uv['temp_anode_dewpoint_water']
+user_raw['cathode_superheat']     = uv['temp_cathode_inlet']         - uv['temp_cathode_dewpoint_water']
+user_raw['power_per_volt']        = uv['power'] / (abs(uv['voltage']) + 1e-9)
+user_raw['current_times_flow']    = uv['current'] * uv['total_cathode_stack_flow']
+
+# ── scale and predict ─────────────────────────────────────────────────────────
+user_df     = pd.DataFrame([{c: user_raw.get(c, float(X[c].mean()))
+                              for c in FEATURE_COLS}])
+user_scaled = scaler.transform(user_df)
+user_tensor = torch.tensor(user_scaled, dtype=torch.float32).to(device)
+
+final_model.eval()
+with torch.no_grad():
+    predicted_flow = final_model(user_tensor).item()
+
+# ── SHAP for this input ───────────────────────────────────────────────────────
+user_shap_vals = explainer.shap_values(user_tensor)
+if isinstance(user_shap_vals, list):
+    user_shap_vals = user_shap_vals[0]
+user_shap_vals = np.array(user_shap_vals)
+if user_shap_vals.ndim == 3:
+    user_shap_vals = user_shap_vals[:, :, 0]
+user_shap_vals = user_shap_vals.flatten()
+
+# ── print prediction ──────────────────────────────────────────────────────────
+print('\n' + '=' * 70)
+print('PREDICTION RESULT — total_anode_stack_flow')
+print('=' * 70)
+print(f'  ➤  Predicted anode flow  : {predicted_flow:.4f} NLPM')
+print(f'     Model test MAE        : {mae:.4f} NLPM')
+print(f'     Expected range        : [{predicted_flow - mae:.4f}, {predicted_flow + mae:.4f}] NLPM')
+print('-' * 70)
+print('  Auto-derived engineering features:')
+print(f'     pressure_anode_diff   = {user_raw["pressure_anode_diff"]:.4f} kPag')
+print(f'     pressure_cathode_diff = {user_raw["pressure_cathode_diff"]:.4f} kPag')
+print(f'     temp_anode_diff       = {user_raw["temp_anode_diff"]:.4f} °C')
+print(f'     temp_cathode_diff     = {user_raw["temp_cathode_diff"]:.4f} °C')
+print(f'     anode_superheat       = {user_raw["anode_superheat"]:.4f} °C')
+print(f'     cathode_superheat     = {user_raw["cathode_superheat"]:.4f} °C')
+print(f'     power_per_volt        = {user_raw["power_per_volt"]:.4f}')
+print(f'     current_times_flow    = {user_raw["current_times_flow"]:.4f}')
+print('=' * 70)
+
+# ── top SHAP drivers ──────────────────────────────────────────────────────────
+shap_df = pd.DataFrame({
+    'feature':   FEATURE_COLS,
+    'shap':      user_shap_vals,
+    'abs_shap':  np.abs(user_shap_vals),
+}).sort_values('abs_shap', ascending=False).reset_index(drop=True)
+
+print('\n  TOP SHAP DRIVERS FOR THIS PREDICTION:')
+print(f'  {"Rank":<5}  {"Feature":<38}  {"SHAP (NLPM)":>12}  Direction')
+print('  ' + '-' * 65)
+for i, row in shap_df.head(10).iterrows():
+    direction = '▲ pushes UP  ' if row['shap'] > 0 else '▼ pushes DOWN'
+    print(f'  {i+1:<5}  {row["feature"]:<38}  {row["shap"]:>+.4f}       {direction}')
+print('=' * 70)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16.  PER-SAMPLE ANALYSIS PLOTS  (5 plots for the user's input)
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n  Generating 5 per-sample analysis plots ...')
+
+# ── Plot A  SHAP Waterfall ────────────────────────────────────────────────────
+user_expl = shap.Explanation(
+    values        = user_shap_vals,
+    base_values   = base_val,
+    data          = user_df[FEATURE_COLS].values[0],
+    feature_names = FEATURE_COLS,
+)
+fig, _ = plt.subplots(figsize=(11, 9))
+shap.plots.waterfall(user_expl, max_display=20, show=False)
+plt.title(
+    f'SHAP Waterfall — Your Input\n'
+    f'Predicted anode flow: {predicted_flow:.4f} NLPM  (base: {base_val:.4f} NLPM)',
+    fontsize=11)
+plt.tight_layout()
+plt.savefig('plots/user_A_shap_waterfall.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ user_A_shap_waterfall.png')
+
+
+# ── Plot B  Signed SHAP Bar ───────────────────────────────────────────────────
+shap_plot_df = shap_df.sort_values('shap')
+colors_bar   = ['#F44336' if v > 0 else '#2196F3' for v in shap_plot_df['shap']]
+fig, ax = plt.subplots(figsize=(10, 10))
+bars = ax.barh(shap_plot_df['feature'], shap_plot_df['shap'],
+               color=colors_bar, edgecolor='white', linewidth=0.4)
+ax.axvline(0, color='black', lw=1.0)
+ax.set_xlabel('SHAP value — contribution to predicted anode flow (NLPM)', fontsize=11)
+ax.set_title(
+    f'Per-Sample SHAP — Signed Feature Contributions\n'
+    f'Predicted anode flow: {predicted_flow:.4f} NLPM', fontsize=12)
+for bar, val in zip(bars, shap_plot_df['shap']):
+    xpos = val + (0.0005 if val >= 0 else -0.0005)
+    ha   = 'left' if val >= 0 else 'right'
+    ax.text(xpos, bar.get_y() + bar.get_height() / 2,
+            f'{val:+.4f}', va='center', ha=ha, fontsize=8)
+ax.grid(alpha=0.3, axis='x')
+plt.tight_layout()
+plt.savefig('plots/user_B_shap_signed_bar.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ user_B_shap_signed_bar.png')
+
+
+# ── Plot C  Prediction in Distribution ───────────────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.hist(y.values, bins=80, color=GRAY, edgecolor='white',
+        linewidth=0.3, alpha=0.7, label='Dataset distribution')
+ax.axvline(predicted_flow, color=RED, lw=2.5,
+           label=f'Predicted: {predicted_flow:.4f} NLPM')
+ax.axvspan(predicted_flow - mae, predicted_flow + mae,
+           alpha=0.18, color='#FF9800',
+           label=f'±MAE band (±{mae:.4f} NLPM)')
+ax.set_xlabel('Anode Flow (NLPM)', fontsize=12)
+ax.set_ylabel('Count', fontsize=12)
+ax.set_title('Predicted Anode Flow vs Full Dataset Distribution', fontsize=13)
+ax.legend(fontsize=10); ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig('plots/user_C_prediction_in_distribution.png', dpi=150)
+plt.close(); print('  ✓ user_C_prediction_in_distribution.png')
+
+
+# ── Plot D  Radar Chart — input vs dataset medians ───────────────────────────
+radar_feats = [
+    'voltage', 'power', 'current',
+    'temp_anode_inlet', 'temp_cathode_inlet',
+    'total_cathode_stack_flow',
+    'pressure_anode_inlet', 'pressure_cathode_inlet',
+    'anode_superheat', 'cathode_superheat',
+]
+medians_r = X[radar_feats].median()
+mins_r    = X[radar_feats].min()
+maxs_r    = X[radar_feats].max()
+
+user_norm_r  = [(user_raw.get(f, float(X[f].mean())) - mins_r[f]) /
+                (maxs_r[f] - mins_r[f] + 1e-9) for f in radar_feats]
+median_norm  = [(medians_r[f] - mins_r[f]) /
+                (maxs_r[f] - mins_r[f] + 1e-9) for f in radar_feats]
+
+N_radar  = len(radar_feats)
+angles   = [n / N_radar * 2 * np.pi for n in range(N_radar)] + [0]
+user_norm_r  += user_norm_r[:1]
+median_norm  += median_norm[:1]
+
+fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+ax.plot(angles, user_norm_r,  color=RED,  lw=2,   label='Your input')
+ax.fill(angles, user_norm_r,  color=RED,  alpha=0.18)
+ax.plot(angles, median_norm, color=BLUE, lw=1.5, linestyle='--', label='Dataset median')
+ax.fill(angles, median_norm, color=BLUE, alpha=0.08)
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(radar_feats, fontsize=9)
+ax.set_ylim(0, 1)
+ax.set_title(
+    f'Input Radar — Your Values vs Dataset Median\n'
+    f'Predicted anode flow: {predicted_flow:.4f} NLPM',
+    fontsize=11, pad=20)
+ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=10)
+plt.tight_layout()
+plt.savefig('plots/user_D_radar_input_vs_median.png', dpi=150, bbox_inches='tight')
+plt.close(); print('  ✓ user_D_radar_input_vs_median.png')
+
+
+# ── Plot E  5 Nearest Neighbours in Test Set ─────────────────────────────────
+dists    = np.linalg.norm(X_te_s - user_scaled, axis=1)
+nn_idx   = np.argsort(dists)[:5]
+nn_act   = y_te.values[nn_idx]
+nn_dists = dists[nn_idx]
+
+fig, ax = plt.subplots(figsize=(9, 5))
+colors_nn = ['#4CAF50' if abs(v - predicted_flow) <= mae else '#FF9800' for v in nn_act]
+bars_nn   = ax.barh(
+    [f'Neighbour {i+1}  (dist={d:.3f})' for i, d in enumerate(nn_dists)],
+    nn_act, color=colors_nn, edgecolor='white', height=0.5)
+ax.axvline(predicted_flow, color=RED, lw=2,
+           label=f'Predicted: {predicted_flow:.4f} NLPM')
+for bar, val in zip(bars_nn, nn_act):
+    ax.text(val + 0.001, bar.get_y() + bar.get_height() / 2,
+            f'{val:.4f} NLPM', va='center', fontsize=9)
+ax.set_xlabel('Actual Anode Flow of Neighbour (NLPM)', fontsize=11)
+ax.set_title(
+    f'5 Nearest Test-Set Neighbours\n'
+    f'Green = within MAE ({mae:.4f} NLPM) of prediction | Orange = outside MAE',
+    fontsize=11)
+ax.legend(fontsize=9); ax.grid(alpha=0.3, axis='x')
+plt.tight_layout()
+plt.savefig('plots/user_E_nearest_neighbours.png', dpi=150)
+plt.close(); print('  ✓ user_E_nearest_neighbours.png')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17.  DONE
+# ─────────────────────────────────────────────────────────────────────────────
+print('\n' + '=' * 70)
+print('PREDICTION COMPLETE')
+print('=' * 70)
+print(f'  ➤  Predicted anode flow   : {predicted_flow:.4f} NLPM')
+print(f'     Expected accuracy band : ±{mae:.4f} NLPM  (model test MAE)')
+print(f'     Likely range           : [{predicted_flow - mae:.4f}, {predicted_flow + mae:.4f}] NLPM')
+print()
+print('  Diagnostic plots  (18) → ./plots/01_* … 18_*')
+print('  SHAP plots         (6) → ./plots/shap_01_* … shap_06_*')
+print('  Per-sample plots   (5) → ./plots/user_A_* … user_E_*')
+print('=' * 70)
